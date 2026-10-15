@@ -15,6 +15,25 @@ export 'elm_timeouts.dart';
 export 'obd_transport.dart';
 export 'transport/byte_transport.dart';
 
+/// Why an [ElmClient] last left the connected state. A reconnect supervisor
+/// uses it to decide whether trying again makes sense.
+enum ElmDisconnectReason {
+  /// `disconnect()` was called (the user, or app shutdown).
+  requested,
+
+  /// The Bluetooth link closed or errored.
+  linkLost,
+
+  /// The adapter stopped answering (see the drain rules below).
+  stalled,
+
+  /// The link could not be opened.
+  connectFailed,
+
+  /// The link opened but the init sequence failed.
+  initFailed,
+}
+
 /// ELM327 command layer: strictly serial command queue, `>` prompt framing,
 /// per-command timeouts, a data-driven initialisation sequence and connection
 /// state. It talks to the adapter only through a [ByteTransport] and
@@ -71,6 +90,10 @@ class ElmClient implements ObdTransport {
 
   String? _lastConnectedAddress;
 
+  ElmDisconnectReason? _lastDisconnectReason;
+  Object? _lastError;
+  int _disconnectRequests = 0;
+
   @override
   Stream<Elm327State> get stateStream => _stateController.stream;
   @override
@@ -85,6 +108,17 @@ class ElmClient implements ObdTransport {
   /// What the adapter answered to each init step of the last connection.
   List<ElmInitResult> get initLog => List.unmodifiable(_initLog);
 
+  /// Why the client last left the connected state; null after a successful
+  /// connect.
+  ElmDisconnectReason? get lastDisconnectReason => _lastDisconnectReason;
+
+  /// The error behind [lastDisconnectReason], when there was one.
+  Object? get lastError => _lastError;
+
+  /// How many times `disconnect()` has been called. A supervisor compares this
+  /// with a snapshot to learn that someone asked to disconnect meanwhile.
+  int get disconnectRequestCount => _disconnectRequests;
+
   /// Connects to [address] and runs the init profile.
   ///
   /// Safe to call after the app restarts: cleans up any stale link first.
@@ -97,6 +131,10 @@ class ElmClient implements ObdTransport {
       return;
     }
 
+    _lastDisconnectReason = null;
+    _lastError = null;
+    final requestsAtStart = _disconnectRequests;
+
     // Tear down any stale link before opening a fresh one.
     await _forceCleanup();
 
@@ -105,7 +143,11 @@ class ElmClient implements ObdTransport {
 
     try {
       await _link.connect(address);
-    } catch (_) {
+    } catch (e) {
+      if (_disconnectRequests == requestsAtStart) {
+        _lastDisconnectReason = ElmDisconnectReason.connectFailed;
+        _lastError = e;
+      }
       _setState(Elm327State.error);
       rethrow;
     }
@@ -129,8 +171,12 @@ class ElmClient implements ObdTransport {
 
       await _init();
       _setState(Elm327State.connected);
-    } catch (_) {
+    } catch (e) {
       await _forceCleanup(); // do not leave a half-initialised link open
+      if (_disconnectRequests == requestsAtStart) {
+        _lastDisconnectReason = ElmDisconnectReason.initFailed;
+        _lastError = e;
+      }
       _setState(Elm327State.error);
       rethrow;
     }
@@ -262,6 +308,7 @@ class ElmClient implements ObdTransport {
     _inputSub = null;
     _failAll(StateError('ELM327 stopped responding'));
     unawaited(_link.disconnect());
+    _lastDisconnectReason = ElmDisconnectReason.stalled;
     _setState(Elm327State.error);
   }
 
@@ -285,12 +332,16 @@ class ElmClient implements ObdTransport {
     _cancelDrain();
     _failAll(StateError('Bluetooth disconnected'));
     unawaited(_link.disconnect()); // drop the stale link reference
+    _lastDisconnectReason = ElmDisconnectReason.linkLost;
     _setState(Elm327State.disconnected);
   }
 
   @override
   Future<void> disconnect() async {
+    _disconnectRequests++;
     await _forceCleanup();
+    _lastDisconnectReason = ElmDisconnectReason.requested;
+    _lastError = null;
     _setState(Elm327State.disconnected);
   }
 
