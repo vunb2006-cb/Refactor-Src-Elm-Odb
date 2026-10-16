@@ -63,6 +63,7 @@ void main() {
           'idx_sample_ts',
           'idx_snapshot_trip_ts',
           'idx_queue_state_retry',
+          'idx_job_def_pid',
         ]),
       );
     });
@@ -253,30 +254,56 @@ void main() {
       await _addVehicle(d, key: 'VIN-OLD');
       await d.close();
 
-      final v2 = DatabaseMigrations([
+      final extended = DatabaseMigrations([
         ...DatabaseMigrations.standard.steps,
         (db) => db.execute('ALTER TABLE vehicle ADD COLUMN notes TEXT'),
       ]);
-      d = await openFile(migrations: v2);
+      d = await openFile(migrations: extended);
       addTearDown(d.close);
 
       final version = _firstInt(await d.db.rawQuery('PRAGMA user_version'));
-      expect(version, 2);
+      expect(version, DatabaseMigrations.standard.version + 1);
       final rows = await d.db.query('vehicle');
       expect(rows.single['vehicle_key'], 'VIN-OLD'); // old data kept
       await d.db.update('vehicle', {'notes': 'ok'}); // new column works
       expect((await d.db.query('vehicle')).single['notes'], 'ok');
     });
 
+    test('upgrading from v1 removes duplicate job PIDs and adds the index',
+        () async {
+      // A database as the v1 app would have left it.
+      final v1Only = DatabaseMigrations([DatabaseMigrations.standard.steps[0]]);
+      var d = await openFile(migrations: v1Only);
+      for (final period in [500, 1000, 2000]) {
+        await d.db.insert('job_def', {'pid': '0C', 'period_ms': period});
+      }
+      await d.db.insert('job_def', {'pid': '0D', 'period_ms': 500});
+      await d.close();
+
+      d = await openFile(); // upgrades to the current schema
+      addTearDown(d.close);
+
+      final rows = await d.db.query('job_def', orderBy: 'id');
+      expect(rows.map((r) => r['pid']), ['0C', '0D']);
+      expect(rows.first['period_ms'], 500); // the oldest row was kept
+      await expectLater(
+        d.db.insert('job_def', {'pid': '0D', 'period_ms': 1}),
+        throwsA(isA<DatabaseException>()),
+      );
+    });
+
     test('a fresh database runs every step', () async {
-      final v2 = DatabaseMigrations([
+      final extended = DatabaseMigrations([
         ...DatabaseMigrations.standard.steps,
         (db) => db.execute('ALTER TABLE vehicle ADD COLUMN notes TEXT'),
       ]);
-      final d = await openFile(migrations: v2);
+      final d = await openFile(migrations: extended);
       addTearDown(d.close);
 
-      expect(_firstInt(await d.db.rawQuery('PRAGMA user_version')), 2);
+      expect(
+        _firstInt(await d.db.rawQuery('PRAGMA user_version')),
+        DatabaseMigrations.standard.version + 1,
+      );
       await d.db.insert(
         'vehicle',
         {'vehicle_key': 'K', 'created_at': 1, 'notes': 'x'},
@@ -284,11 +311,11 @@ void main() {
     });
 
     test('opening a database that is newer than the app fails', () async {
-      final v2 = DatabaseMigrations([
+      final extended = DatabaseMigrations([
         ...DatabaseMigrations.standard.steps,
         (db) => db.execute('ALTER TABLE vehicle ADD COLUMN notes TEXT'),
       ]);
-      final newer = await openFile(migrations: v2);
+      final newer = await openFile(migrations: extended);
       await newer.close();
 
       await expectLater(openFile(), throwsA(isA<Object>()));

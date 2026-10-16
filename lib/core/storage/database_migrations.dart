@@ -32,7 +32,7 @@ class DatabaseMigrations {
   }
 
   /// The migrations the app ships with.
-  static final standard = DatabaseMigrations([_v1]);
+  static final standard = DatabaseMigrations([_v1, _v2]);
 }
 
 /// Schema v1. Times are integer milliseconds since the Unix epoch, UTC.
@@ -132,4 +132,14 @@ Future<void> _v1(Database db) async {
   for (final sql in schemaV1Statements) {
     await db.execute(sql);
   }
+}
+
+/// Schema v2: one job per PID.
+Future<void> _v2(Database db) async {
+  // Keep the oldest row of any duplicated PID, then enforce uniqueness.
+  await db.execute(
+    'DELETE FROM job_def WHERE id NOT IN '
+    '(SELECT MIN(id) FROM job_def GROUP BY pid)',
+  );
+  await db.execute('CREATE UNIQUE INDEX idx_job_def_pid ON job_def(pid)');
 }
