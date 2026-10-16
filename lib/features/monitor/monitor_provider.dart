@@ -1,7 +1,11 @@
+import 'dart:async';
+
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 
+import '../../core/obd/models/sensor_reading.dart';
 import '../../core/obd/obd_service.dart';
 import '../../core/obd/pid_constants.dart';
+import '../../core/obd/scheduler/poll_scheduler.dart';
 import '../../features/connect/connect_provider.dart';
 import '../../features/session/session_provider.dart' show ChartPoint;
 
@@ -75,11 +79,20 @@ class LiveMonitorState {
 
 class LiveMonitorNotifier extends StateNotifier<LiveMonitorState> {
   final ObdService _obd;
+  final PollScheduler _scheduler;
 
   bool _polling = false;
   DateTime? _sessionStart;
+  PollLease? _lease;
+  StreamSubscription<SensorReading>? _readingSub;
 
-  LiveMonitorNotifier(this._obd) : super(const LiveMonitorState());
+  /// PID code to the symbolic name the screen uses ('0C' to 'rpm').
+  static final Map<String, String> _nameByCode = {
+    for (final e in PidConstants.nameToCode.entries) e.value: e.key,
+  };
+
+  LiveMonitorNotifier(this._obd, this._scheduler)
+      : super(const LiveMonitorState());
 
   void togglePid(String pidName) {
     final next = Set<String>.from(state.selectedPids);
@@ -89,6 +102,7 @@ class LiveMonitorNotifier extends StateNotifier<LiveMonitorState> {
       next.add(pidName);
     }
     state = state.copyWith(selectedPids: next);
+    _syncLease();
   }
 
   void clearHistory() {
@@ -119,75 +133,54 @@ class LiveMonitorNotifier extends StateNotifier<LiveMonitorState> {
       state = state.copyWith(vehicleSupportedPids: _obd.supportedPids);
     }
 
-    await _pollLoop();
+    // The user may have pressed stop while the supported PIDs were read.
+    if (!_polling || !mounted) return;
+
+    _readingSub = _scheduler.readings.listen(_onReading);
+    _lease = _scheduler.request(_requestedCodes(), owner: 'monitor');
   }
 
   void stopPolling() {
     _polling = false;
-    // State is updated at the end of _pollLoop when it exits.
+    _lease?.cancel();
+    _lease = null;
+    _readingSub?.cancel();
+    _readingSub = null;
+    if (mounted) state = state.copyWith(isPolling: false);
   }
 
-  Future<void> _pollLoop() async {
-    while (_polling && mounted) {
-      // Link down (for example while the app reconnects): wait instead of
-      // spinning through reads that fail instantly. Polling resumes by itself
-      // once the transport is connected again.
-      if (!_obd.connector.isConnected) {
-        await Future.delayed(const Duration(milliseconds: 500));
-        continue;
-      }
-
-      final pids = state.selectedPids.toList();
-
-      if (pids.isEmpty) {
-        await Future.delayed(const Duration(milliseconds: 500));
-        continue;
-      }
-
-      final elapsed =
-          DateTime.now().difference(_sessionStart!).inSeconds;
-      final newValues = <String, double>{};
-
-      for (final pidName in pids) {
-        if (!_polling || !mounted) break;
-
-        final code = PidConstants.codeForName(pidName) ?? pidName;
-
-        // Skip PIDs the ECU doesn't support (avoids command-timeout waste).
-        if (_obd.supportedPids.isNotEmpty &&
-            !_obd.isPidSupported(code)) {
-          continue;
-        }
-
-        try {
-          final value = await _obd.readPID(code);
-          if (value != null) newValues[pidName] = value;
-        } catch (_) {
-          // Individual PID failure is non-fatal — skip and continue.
-        }
-      }
-
-      if (!mounted) break;
-
-      // Merge new values into history.
-      final prev = state.history;
-      final next = <String, List<ChartPoint>>{
-        for (final k in prev.keys) k: prev[k]!,
-      };
-      for (final entry in newValues.entries) {
-        next[entry.key] = [
-          ...(next[entry.key] ?? []),
-          (t: elapsed, v: entry.value),
-        ];
-      }
-
-      state = state.copyWith(
-        currentValues: {...state.currentValues, ...newValues},
-        history: next,
-      );
+  /// PID codes to read: what the user selected, minus what the vehicle does
+  /// not support (avoids command-timeout waste).
+  Set<String> _requestedCodes() {
+    final codes = <String>{};
+    for (final name in state.selectedPids) {
+      final code = PidConstants.codeForName(name) ?? name;
+      if (_obd.supportedPids.isNotEmpty && !_obd.isPidSupported(code)) continue;
+      codes.add(code);
     }
+    return codes;
+  }
 
-    if (mounted) state = state.copyWith(isPolling: false);
+  void _syncLease() => _lease?.update(_requestedCodes());
+
+  void _onReading(SensorReading r) {
+    if (!mounted || !_polling) return;
+    final name = _nameByCode[r.pid] ?? r.pid;
+    if (!state.selectedPids.contains(name)) return;
+
+    // After "clear history" the time axis restarts at the next reading.
+    final start = _sessionStart ??= r.timestamp;
+    final elapsed = r.timestamp.difference(start).inSeconds;
+
+    final prev = state.history;
+    final points = [
+      ...(prev[name] ?? const <ChartPoint>[]),
+      (t: elapsed, v: r.value),
+    ];
+    state = state.copyWith(
+      currentValues: {...state.currentValues, name: r.value},
+      history: {...prev, name: points},
+    );
   }
 }
 
@@ -196,7 +189,10 @@ class LiveMonitorNotifier extends StateNotifier<LiveMonitorState> {
 final liveMonitorProvider =
     StateNotifierProvider.autoDispose<LiveMonitorNotifier, LiveMonitorState>(
         (ref) {
-  final notifier = LiveMonitorNotifier(ref.watch(obdServiceProvider));
+  final notifier = LiveMonitorNotifier(
+    ref.watch(obdServiceProvider),
+    ref.watch(pollSchedulerProvider),
+  );
   ref.onDispose(notifier.stopPolling);
   return notifier;
 });

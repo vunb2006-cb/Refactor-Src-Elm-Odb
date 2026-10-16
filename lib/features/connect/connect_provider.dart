@@ -1,8 +1,13 @@
+import 'dart:async';
+
 import 'package:flutter_bluetooth_serial/flutter_bluetooth_serial.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 
+import '../../core/obd/bus/obd_command_bus.dart';
 import '../../core/obd/elm327_connector.dart';
+import '../../core/obd/jobs/job_definition_repository.dart';
 import '../../core/obd/obd_service.dart';
+import '../../core/obd/scheduler/poll_scheduler.dart';
 import '../../core/obd/reconnect/reconnect_status.dart';
 import '../../core/obd/reconnect/reconnect_supervisor.dart';
 import '../../core/obd/simulated/fault_profile.dart';
@@ -53,8 +58,37 @@ final activeTransportProvider = Provider<ObdTransport>((ref) {
       : ref.watch(elm327Provider);
 });
 
+/// The one door to the adapter: every OBD read in the app goes through it, so
+/// urgent commands (fault codes) overtake background polling.
+final obdCommandBusProvider = Provider<ObdCommandBus>((ref) {
+  final bus = ObdCommandBus(ref.watch(activeTransportProvider));
+  ref.onDispose(bus.dispose);
+  return bus;
+});
+
 final obdServiceProvider = Provider<ObdService>((ref) {
-  return ObdService(ref.watch(activeTransportProvider));
+  return ObdService(ref.watch(obdCommandBusProvider));
+});
+
+/// Job definitions (period and priority per PID). In memory for now, seeded
+/// with the defaults; swap in the SQLite repository once the database is
+/// opened at app start.
+final jobDefinitionRepositoryProvider = Provider<JobDefinitionRepository>((ref) {
+  final repository = InMemoryJobDefinitionRepository();
+  unawaited(repository.seedDefaults()); // does not wait: finishes at once
+  return repository;
+});
+
+/// Reads the PIDs screens ask for, on schedule, at low priority.
+final pollSchedulerProvider = Provider<PollScheduler>((ref) {
+  final service = ref.watch(obdServiceProvider);
+  final scheduler = PollScheduler(
+    read: (pid, priority) => service.readPID(pid, priority: priority),
+    transport: ref.watch(obdCommandBusProvider),
+    lookupJob: ref.watch(jobDefinitionRepositoryProvider).load,
+  );
+  ref.onDispose(scheduler.dispose);
+  return scheduler;
 });
 
 // ─── Connection state ─────────────────────────────────────────────────────────

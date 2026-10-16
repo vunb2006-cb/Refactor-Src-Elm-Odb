@@ -6,6 +6,8 @@ import 'dtc_decoder.dart';
 import 'pid_constants.dart';
 import 'models/dtc_code.dart';
 import 'models/sensor_reading.dart';
+import 'bus/bus_priority.dart';
+import 'bus/obd_command_bus.dart';
 import 'capability/capability_probe.dart';
 import 'capability/capability_profile.dart';
 
@@ -34,17 +36,26 @@ class ObdService {
 
   ObdService(this.connector);
 
+  /// Sends [cmd] with [priority] when the connector is an [ObdCommandBus];
+  /// any other connector just sends it.
+  Future<String> _send(String cmd, BusPriority priority) {
+    final c = connector;
+    return c is ObdCommandBus
+        ? c.send(cmd, priority: priority)
+        : c.sendCommand(cmd);
+  }
+
   // ─── DTCs ──────────────────────────────────────────────────────────────────
 
-  /// Read stored fault codes (mode 03).
+  /// Read stored fault codes (mode 03). The user is waiting: high priority.
   Future<List<DtcCode>> readDTCs() async {
-    final response = await connector.sendCommand('03');
+    final response = await _send('03', BusPriority.high);
     return DtcDecoder.decode(response, isPending: false);
   }
 
   /// Read pending fault codes (mode 07).
   Future<List<DtcCode>> readPendingDTCs() async {
-    final response = await connector.sendCommand('07');
+    final response = await _send('07', BusPriority.high);
     return DtcDecoder.decode(response, isPending: true);
   }
 
@@ -66,7 +77,7 @@ class ObdService {
     for (final pid in ffPids) {
       try {
         // Mode 02: freeze frame, frame 0
-        final response = await connector.sendCommand('02${pid}00');
+        final response = await _send('02${pid}00', BusPriority.high);
         // Mode 02 response header is "42" + pid
         final decoded = _decodeMode02(pid, response);
         if (decoded != null) result[pid] = decoded;
@@ -92,9 +103,13 @@ class ObdService {
 
   // ─── Single PID reads ──────────────────────────────────────────────────────
 
-  /// Read a single PID value.
-  Future<double?> readPID(String pid) async {
-    final response = await connector.sendCommand('01$pid');
+  /// Read a single PID value. [priority] says how urgent it is: the polling
+  /// scheduler uses [BusPriority.low]; one-off reads default to normal.
+  Future<double?> readPID(
+    String pid, {
+    BusPriority priority = BusPriority.normal,
+  }) async {
+    final response = await _send('01$pid', priority);
     return PidDecoder.decode(pid, response);
   }
 
